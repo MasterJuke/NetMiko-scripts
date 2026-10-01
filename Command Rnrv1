@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+Interactive multi-device SSH command runner for Cisco IOS / IOS-XE.
+Requires:  pip install netmiko
+Just run:  python run_commands.py
+"""
+import getpass
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+os.system("")  # enables ANSI colors in Windows terminals
+GREEN, RED, BOLD, RESET = "\033[92m", "\033[91m", "\033[1m", "\033[0m"
+
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+DEVICE_TYPE = "cisco_ios"  # works for both IOS and IOS-XE
+WORKERS = 10
+TIMEOUT = 30
+ERROR_MARKERS = ("% invalid", "% incomplete", "% ambiguous", "invalid input",
+                 "unknown command", "% bad", "% unrecognized")
+
+
+def read_lines(prompt):
+    """Read lines until a blank line is entered."""
+    print(prompt)
+    lines = []
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        lines.append(line)
+    return lines
+
+
+def run_on_device(host, username, password, commands, config_mode):
+    res = {"host": host, "connected": False, "error": None, "results": []}
+    try:
+        conn = ConnectHandler(device_type=DEVICE_TYPE, host=host, username=username,
+                              password=password, secret=password, conn_timeout=TIMEOUT)
+    except NetmikoAuthenticationException:
+        res["error"] = "Authentication failed"
+        return res
+    except NetmikoTimeoutException:
+        res["error"] = "Connection timed out"
+        return res
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+        return res
+
+    res["connected"] = True
+    try:
+        try:
+            conn.enable()
+        except Exception:
+            pass
+        if config_mode:
+            try:
+                out = conn.send_config_set(commands)
+                bad = any(m in out.lower() for m in ERROR_MARKERS)
+                res["results"] = [(c, not bad, out) for c in commands]
+            except Exception as e:
+                res["results"] = [(c, False, f"{type(e).__name__}: {e}") for c in commands]
+        else:
+            for c in commands:
+                try:
+                    out = conn.send_command(c, read_timeout=TIMEOUT)
+                    ok = not any(m in out.lower() for m in ERROR_MARKERS)
+                    res["results"].append((c, ok, out))
+                except Exception as e:
+                    res["results"].append((c, False, f"{type(e).__name__}: {e}"))
+    finally:
+        conn.disconnect()
+    return res
+
+
+def print_summary(results):
+    line = "=" * 70
+    good, bad = [], []
+    print(f"\n{line}\n{BOLD}SUMMARY{RESET}\n{line}")
+    for r in sorted(results, key=lambda x: x["host"]):
+        if not r["connected"]:
+            bad.append(r["host"])
+            print(f"\n{RED}{BOLD}{r['host']}  -  CONNECTION FAILED: {r['error']}{RESET}")
+            continue
+        all_ok = all(ok for _, ok, _ in r["results"])
+        (good if all_ok else bad).append(r["host"])
+        color = GREEN if all_ok else RED
+        print(f"\n{color}{BOLD}{r['host']}{RESET}")
+        for cmd, ok, _ in r["results"]:
+            tag = f"{GREEN}[SUCCESS]{RESET}" if ok else f"{RED}[FAILED] {RESET}"
+            print(f"  {tag} {cmd}")
+    print(f"\n{line}")
+    print(f"{GREEN}{BOLD}Successful devices ({len(good)}):{RESET} {', '.join(good) or '-'}")
+    print(f"{RED}{BOLD}Failed devices     ({len(bad)}):{RESET} {', '.join(bad) or '-'}")
+    print(line)
+
+
+def main():
+    raw = read_lines("Enter device IPs/hostnames (one per line or comma-separated). Blank line to finish:")
+    hosts = list(dict.fromkeys(h for l in raw for h in l.replace(",", " ").split()))
+    if not hosts:
+        return print("No devices entered.")
+
+    username = input("Username: ").strip()
+    password = getpass.getpass("Password: ")
+
+    commands = read_lines("Enter commands, one per line. Blank line to finish:")
+    if not commands:
+        return print("No commands entered.")
+
+    config_mode = input("Send as config-mode commands? (y/N): ").strip().lower() == "y"
+    show_out = input("Print command output? (y/N): ").strip().lower() == "y"
+
+    print(f"\nRunning {len(commands)} command(s) on {len(hosts)} device(s)...\n")
+    results = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = [pool.submit(run_on_device, h, username, password, commands, config_mode)
+                   for h in hosts]
+        for f in as_completed(futures):
+            r = f.result()
+            print(f"  {r['host']}: {'done' if r['connected'] else 'FAILED - ' + r['error']}")
+            results.append(r)
+
+    if show_out:
+        for r in sorted(results, key=lambda x: x["host"]):
+            for cmd, ok, out in r["results"]:
+                print(f"\n--- {r['host']} | {cmd} ---\n{out}")
+
+    print_summary(results)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        input("\nPress Enter to exit...")  # keeps the window open so you can read the results
