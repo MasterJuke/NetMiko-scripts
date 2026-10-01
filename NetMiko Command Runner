@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+Run commands on a list of network devices over SSH and print a success/fail summary.
+
+Requires:  pip install netmiko
+
+Usage examples:
+  python run_commands.py -d devices.txt
+  python run_commands.py -d devices.txt -c "show version" "show ip int brief"
+  python run_commands.py -d devices.txt -f commands.txt --config --save-output out/
+  python run_commands.py -d devices.txt -t juniper_junos -w 20
+
+devices.txt  (one per line; '#' comments allowed). Formats:
+  192.168.1.1
+  192.168.1.2,cisco_ios
+  192.168.1.3,cisco_nxos,admin,secret      <- per-device device_type/user/pass
+"""
+import argparse
+import getpass
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+from netmiko import ConnectHandler
+from netmiko.exceptions import (
+    NetmikoAuthenticationException,
+    NetmikoTimeoutException,
+)
+
+# Output containing any of these (case-insensitive) is flagged as a failed command.
+ERROR_MARKERS = (
+    "% invalid", "% incomplete", "% ambiguous", "invalid input",
+    "unknown command", "syntax error", "command not found", "error:",
+)
+
+
+def load_devices(path, default_type, default_user, default_pass):
+    devices = []
+    with open(path) as f:
+        for line in f:
+            line = line.split("#")[0].strip()
+            if not line:
+                continue
+            p = [x.strip() for x in line.split(",")]
+            devices.append({
+                "host": p[0],
+                "device_type": p[1] if len(p) > 1 and p[1] else default_type,
+                "username": p[2] if len(p) > 2 and p[2] else default_user,
+                "password": p[3] if len(p) > 3 and p[3] else default_pass,
+            })
+    return devices
+
+
+def get_commands(args):
+    if args.commands:
+        return args.commands
+    if args.command_file:
+        with open(args.command_file) as f:
+            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    print("Enter commands, one per line. Blank line to finish:")
+    cmds = []
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        cmds.append(line)
+    return cmds
+
+
+def run_on_device(dev, commands, config_mode, timeout, enable_secret):
+    """Returns dict: host, connected, error, results=[(cmd, ok, output)]"""
+    res = {"host": dev["host"], "connected": False, "error": None, "results": []}
+    params = {
+        "device_type": dev["device_type"],
+        "host": dev["host"],
+        "username": dev["username"],
+        "password": dev["password"],
+        "conn_timeout": timeout,
+        "secret": enable_secret or dev["password"],
+    }
+    try:
+        conn = ConnectHandler(**params)
+    except NetmikoAuthenticationException:
+        res["error"] = "Authentication failed"
+        return res
+    except NetmikoTimeoutException:
+        res["error"] = "Connection timed out"
+        return res
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+        return res
+
+    res["connected"] = True
+    try:
+        try:
+            conn.enable()
+        except Exception:
+            pass  # not all platforms use enable mode
+
+        if config_mode:
+            try:
+                out = conn.send_config_set(commands)
+                bad = any(m in out.lower() for m in ERROR_MARKERS)
+                for c in commands:
+                    res["results"].append((c, not bad, out))
+            except Exception as e:
+                for c in commands:
+                    res["results"].append((c, False, f"{type(e).__name__}: {e}"))
+        else:
+            for c in commands:
+                try:
+                    out = conn.send_command(c, read_timeout=timeout)
+                    ok = not any(m in out.lower() for m in ERROR_MARKERS)
+                    res["results"].append((c, ok, out))
+                except Exception as e:
+                    res["results"].append((c, False, f"{type(e).__name__}: {e}"))
+    finally:
+        conn.disconnect()
+    return res
+
+
+def save_output(folder, results):
+    os.makedirs(folder, exist_ok=True)
+    for r in results:
+        with open(os.path.join(folder, f"{r['host']}.txt"), "w") as f:
+            if r["error"]:
+                f.write(f"CONNECTION FAILED: {r['error']}\n")
+            for cmd, ok, out in r["results"]:
+                f.write(f"===== {cmd}  [{'OK' if ok else 'FAILED'}] =====\n{out}\n\n")
+
+
+def print_summary(results, show_output):
+    line = "=" * 70
+    if show_output:
+        for r in results:
+            for cmd, ok, out in r["results"]:
+                print(f"\n--- {r['host']} | {cmd} ---\n{out}")
+
+    print(f"\n{line}\nSUMMARY\n{line}")
+    ok_devs, bad_devs = [], []
+    for r in sorted(results, key=lambda x: x["host"]):
+        if not r["connected"]:
+            bad_devs.append(r)
+            print(f"[CONNECT FAIL] {r['host']:<20} {r['error']}")
+            continue
+        failed = [c for c, ok, _ in r["results"] if not ok]
+        passed = len(r["results"]) - len(failed)
+        if failed:
+            bad_devs.append(r)
+            print(f"[PARTIAL/FAIL] {r['host']:<20} {passed} ok, {len(failed)} failed")
+            for c in failed:
+                print(f"                 x {c}")
+        else:
+            ok_devs.append(r)
+            print(f"[SUCCESS]      {r['host']:<20} {passed}/{len(r['results'])} commands ok")
+
+    print(f"{line}\nSuccessful devices: {len(ok_devs)}")
+    for r in ok_devs:
+        print(f"  + {r['host']}")
+    print(f"Failed devices:     {len(bad_devs)}")
+    for r in bad_devs:
+        print(f"  - {r['host']}")
+    print(line)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Run commands on many devices via SSH.")
+    ap.add_argument("-d", "--devices", required=True, help="Device list file")
+    ap.add_argument("-c", "--commands", nargs="+", help="Commands to run")
+    ap.add_argument("-f", "--command-file", help="File with one command per line")
+    ap.add_argument("-t", "--device-type", default="cisco_ios",
+                    help="Default netmiko device_type (default: cisco_ios)")
+    ap.add_argument("-u", "--username", help="Default username (prompted if omitted)")
+    ap.add_argument("--config", action="store_true", help="Send as config-mode commands")
+    ap.add_argument("-w", "--workers", type=int, default=10, help="Parallel connections")
+    ap.add_argument("--timeout", type=int, default=30, help="Timeout in seconds")
+    ap.add_argument("--show-output", action="store_true", help="Print command output")
+    ap.add_argument("--save-output", metavar="DIR", help="Save per-device output to DIR")
+    args = ap.parse_args()
+
+    username = args.username or input("Username: ")
+    password = getpass.getpass("Password: ")
+
+    devices = load_devices(args.devices, args.device_type, username, password)
+    if not devices:
+        sys.exit("No devices found in device file.")
+    commands = get_commands(args)
+    if not commands:
+        sys.exit("No commands provided.")
+
+    print(f"\nRunning {len(commands)} command(s) on {len(devices)} device(s)...\n")
+    results = []
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {
+            pool.submit(run_on_device, d, commands, args.config, args.timeout, None): d
+            for d in devices
+        }
+        for fut in as_completed(futures):
+            r = fut.result()
+            status = "connected" if r["connected"] else f"FAILED ({r['error']})"
+            print(f"  {r['host']}: {status}")
+            results.append(r)
+
+    print_summary(results, args.show_output)
+
+    if args.save_output:
+        folder = os.path.join(args.save_output, datetime.now().strftime("%Y%m%d_%H%M%S"))
+        save_output(folder, results)
+        print(f"Output saved to {folder}/")
+
+
+if __name__ == "__main__":
+    main()
